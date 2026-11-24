@@ -609,20 +609,26 @@ def pipeline_join_to_report(
 def pipeline_ranking_to_metric(
     ranking_boards: list[RankingBoard],
     data_rows: dict[str, list[dict[str, Any]]],
+    *,
+    code_fields: dict[str, str] | None = None,
 ) -> dict[str, Any]:
     """排行榜到指标定义的完整管道。
 
     1. 从排行榜读取排行指标定义
-    2. 执行指标计算和排序
-    3. 返回 TOP N 排行结果
+    2. 先按排行维度聚合、再对分组排序，生成分组排行批次
+    3. 返回 TOP N 排行结果（附带批次，供指标复核读取当次真正入榜的地区）
     """
     rankings = []
+    code_fields = code_fields or {}
 
     for rb in ranking_boards:
         metric = rb.rank_metric
         rows = data_rows.get(rb.rank_id, [])
+        code_field = code_fields.get(rb.rank_id, "")
 
-        top_items = rb.compute_ranking(rows)
+        batch = rb.build_batch(rows, code_field=code_field)
+        top_items = batch.entries
+        region_field = batch.region_field
 
         rankings.append({
             "rank_id": rb.rank_id,
@@ -632,11 +638,11 @@ def pipeline_ranking_to_metric(
             "dimensions": [d.dimension_name for d in rb.rank_dimensions],
             "top_n": rb.top_n,
             "result_count": len(top_items),
+            "batch_id": batch.batch_id,
+            "batch": batch.to_dict(),
             "top_3": [
                 {
-                    "dimension": str(item.get(
-                        rb.rank_dimensions[0].field_source, ""
-                    )) if rb.rank_dimensions else "",
+                    "dimension": str(item.get(region_field, "")),
                     "value": float(item.get(metric.field_name, 0)),
                 }
                 for item in top_items[:3]

@@ -5,10 +5,15 @@
 """
 from __future__ import annotations
 
+import copy
+import hashlib
+import json
+import re
+import threading
 from dataclasses import dataclass, field
 from datetime import datetime
 from enum import Enum
-from typing import Any
+from typing import Any, Iterable
 
 
 # ============================================================
@@ -733,7 +738,12 @@ class DatasetJoin:
 
 @dataclass
 class RankingBoard:
-    """按指标的排行计算方案。"""
+    """按指标的排行计算方案。
+
+    排行不是对交易流水逐行取名次：先按排行维度把交易分组，再按指标定义里的
+    聚合方式（SUM/AVG/COUNT...）把每组算成一个值，最后对分组结果排序。
+    这样同一地区的多笔交易不会因为单笔更大而挤掉合计更大的地区。
+    """
     rank_id: str
     rank_metric: MetricDef
     rank_dimensions: list[DimensionDef] = field(default_factory=list)
@@ -741,17 +751,362 @@ class RankingBoard:
     top_n: int = 10
     update_frequency: str = "daily"
 
+    def group_fields(self) -> list[str]:
+        """分组字段：优先使用排行维度的字段来源，缺省回落到指标定义的维度键。"""
+        fields = [d.field_source for d in self.rank_dimensions if d.field_source]
+        return fields or list(self.rank_metric.dimension_keys)
+
     def compute_ranking(
         self,
         rows: list[dict[str, Any]],
+        *,
+        code_field: str = "",
     ) -> list[dict[str, Any]]:
-        """按指定指标对行数据进行排序并返回 TOP N。"""
-        sorted_rows = sorted(
-            rows,
-            key=lambda x: float(x.get(self.rank_metric.field_name, 0)),
-            reverse=True,
+        """按指标定义聚合后对分组排序，返回 TOP N 分组。
+
+        - 相同分组键的交易先聚合，再参与排名；
+        - 排序只看聚合值，输入行的先后顺序不影响结果；
+        - 聚合值相同时，先看地区编号（若提供），再按分组键自然序，
+          保证同样的输入集合始终得到同样的名次。
+        """
+        return self.build_entries(rows, code_field=code_field)[:self.top_n]
+
+    def build_entries(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        code_field: str = "",
+    ) -> list[dict[str, Any]]:
+        """构造全部分组排行条目（不受 TOP N 截断，供批次与复核使用）。"""
+        fields = self.group_fields()
+        if not code_field:
+            code_field = _detect_code_field(rows, exclude=set(fields))
+        metric_field = self.rank_metric.field_name
+        grouped: dict[tuple[str, ...], list[dict[str, Any]]] = {}
+        row_level = not fields
+        for index, row in enumerate(rows):
+            if row_level:
+                # 没有分组维度时退回逐行排名，保持旧口径可用。
+                key = (f"\u0000{index}",)
+            else:
+                key = tuple(str(row.get(name, "") or "") for name in fields)
+            grouped.setdefault(key, []).append(row)
+
+        entries: list[dict[str, Any]] = []
+        for key, group_rows in grouped.items():
+            if row_level:
+                entry = dict(group_rows[0])
+            else:
+                entry = {name: key[index] for index, name in enumerate(fields)}
+            entry[metric_field] = float(self.rank_metric.compute(group_rows))
+            if not row_level:
+                entry["group_key"] = " / ".join(key) if len(key) > 1 else (key[0] if key else "")
+            if code_field:
+                codes = sorted(
+                    {
+                        str(row.get(code_field, "") or "")
+                        for row in group_rows
+                        if str(row.get(code_field, "") or "")
+                    },
+                    key=_natural_key,
+                )
+                entry[code_field] = codes[0] if codes else ""
+            tie_source = entry.get(code_field) if code_field else ""
+            if not tie_source:
+                tie_source = entry.get("group_key", "")
+            if not tie_source:
+                # 无维度/无编号时用整行内容定序，保证换序重算名次不漂移。
+                tie_source = _canonical_digest(entry)
+            entry["_tie_key"] = _natural_key(tie_source)
+            entries.append(entry)
+
+        entries.sort(key=lambda item: (-item[metric_field], item["_tie_key"]))
+        for index, entry in enumerate(entries, start=1):
+            entry["rank"] = index
+            entry.pop("_tie_key", None)
+        return entries
+
+    def build_batch(
+        self,
+        rows: list[dict[str, Any]],
+        *,
+        code_field: str = "",
+        created_at: str = "",
+    ) -> "RankingBatch":
+        """生成可复核、可复算的分组排行批次。
+
+        批次摘要只取决于交易内容本身（与输入顺序无关），所以同一批交易
+        换一个顺序重新计算，得到的批次编号与名次完全一致。
+        """
+        if not code_field:
+            code_field = _detect_code_field(rows, exclude=set(self.group_fields()))
+        entries = self.compute_ranking(rows, code_field=code_field)
+        fields = self.group_fields()
+        source_digest = _rows_digest(rows)
+        config = {
+            "rank_id": self.rank_id,
+            "metric": self.rank_metric.metric_id,
+            "fields": fields,
+            "code_field": code_field,
+            "top_n": self.top_n,
+        }
+        digest = hashlib.sha256(
+            json.dumps(
+                {"config": config, "source": source_digest},
+                sort_keys=True, ensure_ascii=False,
+            ).encode("utf-8")
+        ).hexdigest()
+        return RankingBatch(
+            batch_id=f"{self.rank_id}-{digest[:12]}",
+            board_id=self.rank_id,
+            metric=self.rank_metric,
+            metric_field=self.rank_metric.field_name,
+            aggregation=self.rank_metric.aggregation.value,
+            group_fields=fields,
+            code_field=code_field,
+            top_n=self.top_n,
+            entries=entries,
+            source_digest=source_digest,
+            digest=digest,
+            created_at=created_at,
         )
-        return sorted_rows[:self.top_n]
+
+
+@dataclass
+class RankingBatch:
+    """分组排行批次：一次排行计算真正入榜的分组及其指标值。
+
+    指标复核只允许读取这里的入榜地区，不能拿批次外的地区补退款。
+    """
+    batch_id: str
+    board_id: str
+    metric: MetricDef | None
+    metric_field: str
+    aggregation: str
+    group_fields: list[str] = field(default_factory=list)
+    code_field: str = ""
+    top_n: int = 10
+    entries: list[dict[str, Any]] = field(default_factory=list)
+    source_digest: str = ""
+    digest: str = ""
+    created_at: str = ""
+
+    @property
+    def region_field(self) -> str:
+        return self.group_fields[0] if self.group_fields else ""
+
+    def region_keys(self) -> list[str]:
+        return [str(entry.get(self.region_field, "") or "") for entry in self.entries]
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "batch_id": self.batch_id,
+            "board_id": self.board_id,
+            "metric": {
+                "metric_id": self.metric.metric_id if self.metric else "",
+                "metric_name": self.metric.metric_name if self.metric else "",
+                "field_name": self.metric_field,
+                "aggregation": self.aggregation,
+            },
+            "group_fields": list(self.group_fields),
+            "code_field": self.code_field,
+            "top_n": self.top_n,
+            "created_at": self.created_at,
+            "source_digest": self.source_digest,
+            "digest": self.digest,
+            "entries": [dict(entry) for entry in self.entries],
+            "regions": self.region_keys(),
+        }
+
+
+class SpotCheckRegistry:
+    """抽核登记簿：同一次抽核并发提交只登记一份，已登记结果保持不变。
+
+    轮次键由分组排行批次、名额和上期抽核名单共同决定，与交易输入顺序无关，
+    因此换序重算仍然落在同一轮，不会重复登记，也不会改掉第一次的名次。
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._records: dict[str, dict[str, Any]] = {}
+
+    def register(
+        self,
+        report: dict[str, Any],
+        round_key: str | None = None,
+    ) -> tuple[dict[str, Any], bool]:
+        """登记一次抽核；重复提交返回第一次的结果，registered=False。"""
+        key = round_key or str(report.get("round_key", ""))
+        with self._lock:
+            existing = self._records.get(key)
+            if existing is not None:
+                return copy.deepcopy(existing), False
+            record = copy.deepcopy(report)
+            record["round_key"] = key
+            record["status"] = "已登记"
+            record["registered"] = True
+            record["revision"] = 1
+            self._records[key] = record
+            return copy.deepcopy(record), True
+
+    def approve(self, round_key: str) -> dict[str, Any] | None:
+        with self._lock:
+            record = self._records.get(round_key)
+            if record is None:
+                return None
+            record["status"] = "已审定"
+            record["revision"] = int(record.get("revision", 1)) + 1
+            return copy.deepcopy(record)
+
+    def recompute(
+        self,
+        round_key: str,
+        report: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        """复算已审定的抽核：只核对结果是否漂移，不回写已审定记录。"""
+        with self._lock:
+            record = self._records.get(round_key)
+            if record is None:
+                return None
+            result = copy.deepcopy(record)
+            result["recomputed_digest"] = report.get("digest", "")
+            result["recomputed_target"] = report.get("target")
+            result["matches"] = report.get("digest") == record.get("digest")
+            result["recomputed"] = True
+            return result
+
+    def get(self, round_key: str) -> dict[str, Any] | None:
+        with self._lock:
+            record = self._records.get(round_key)
+            return copy.deepcopy(record) if record is not None else None
+
+    def records(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return [copy.deepcopy(record) for record in self._records.values()]
+
+
+@dataclass
+class MetricReview:
+    """指标复核：从分组排行批次取当次入榜地区，按原交易算复核指标。
+
+    复核对象来自批次本身；未入榜的地区即使在交易明细里，也不能进入报告，
+    更不能把它的退款算到本轮抽核对象头上。
+    """
+    batch: RankingBatch
+    transactions: list[dict[str, Any]]
+    quota: int = 1
+    previous_regions: list[str] = field(default_factory=list)
+    region_field: str = ""
+    code_field: str = ""
+    refund_field: str = "退款"
+    transaction_id_field: str = "交易编号"
+
+    def _field(self, name: str) -> str:
+        if name:
+            return name
+        return self.batch.region_field or (self.batch.group_fields[0] if self.batch.group_fields else "地区")
+
+    def build(self, *, round_key: str = "") -> dict[str, Any]:
+        region_field = self._field(self.region_field)
+        transactions_by_region: dict[str, list[dict[str, Any]]] = {}
+        for row in self.transactions:
+            region = str(row.get(region_field, "") or "")
+            if not region:
+                continue
+            transactions_by_region.setdefault(region, []).append(row)
+
+        previous = {str(item) for item in self.previous_regions}
+        batch_regions = set(self.batch.region_keys())
+        metric = self.batch.metric
+        aggregation = self.batch.aggregation
+
+        candidates: list[dict[str, Any]] = []
+        for entry in self.batch.entries:
+            region = str(entry.get(region_field, "") or "")
+            if not region:
+                continue
+            region_rows = transactions_by_region.get(region, [])
+            # 指标值直接取分组排行批次里的值，保证复核报告与当次排行一致；
+            # 退款和成交笔数则回到该地区的原始交易上重新计算。
+            value = float(entry.get(self.batch.metric_field, 0.0))
+            recomputed = float(metric.compute(region_rows)) if metric is not None else value
+            count = _transaction_count(region_rows, self.transaction_id_field)
+            refund = _sum_field(region_rows, self.refund_field)
+            code = ""
+            if self.batch.code_field:
+                code = str(entry.get(self.batch.code_field, "") or "")
+            if not code:
+                codes = sorted(
+                    {
+                        str(row.get(self.code_field, "") or "")
+                        for row in region_rows
+                        if str(row.get(self.code_field, "") or "")
+                    },
+                    key=_natural_key,
+                )
+                code = codes[0] if codes else ""
+            candidates.append({
+                "rank": int(entry.get("rank", len(candidates) + 1)),
+                "batch_rank": int(entry.get("rank", len(candidates) + 1)),
+                "region": region,
+                "region_code": code,
+                "value": value,
+                "source_value": recomputed,
+                "transaction_count": count,
+                "transaction_ids": _transaction_ids(region_rows, self.transaction_id_field),
+                "refund": refund,
+                "previous_audited": region in previous,
+                "in_batch": True,
+                "tie_reason": "",
+            })
+
+        # 抽核对象排序：指标值降序；同额时上期已抽核的地区让位（轮换），
+        # 再看退款更高的先抽，最后才用地区编号自然序兜底。
+        # 西区/东区同额时，西区虽退款更高但上期刚抽过，本轮交给东区；
+        # 两条依据的冲突在这里按「先轮换、后风险」的次序落定。
+        candidates.sort(key=lambda item: (
+            -item["value"],
+            1 if item["previous_audited"] else 0,
+            -item["refund"],
+            _natural_key(item["region_code"] or item["region"]),
+            _natural_key(item["region"]),
+        ))
+        for index, item in enumerate(candidates, start=1):
+            item["rank"] = index
+            item["selected"] = False
+        _annotate_ties(candidates)
+
+        quota = max(0, int(self.quota))
+        selected = candidates[:quota]
+        selected_regions = [item["region"] for item in selected]
+        for item in selected:
+            item["selected"] = True
+
+        report_core = {
+            "batch_id": self.batch.batch_id,
+            "board_id": self.batch.board_id,
+            "metric": {
+                "metric_id": metric.metric_id if metric else "",
+                "metric_name": metric.metric_name if metric else "",
+                "field_name": self.batch.metric_field,
+                "aggregation": aggregation,
+            },
+            "dimension": region_field,
+            "code_field": self.batch.code_field or self.code_field,
+            "quota": quota,
+            "tie_breaker": "指标值降序 > 上期已抽核让位 > 退款降序 > 地区编号自然序",
+            "previous_regions": sorted(previous),
+            "regions": candidates,
+            "selected": selected_regions,
+            "target": selected_regions[0] if selected_regions else None,
+            "total_refund": round(sum(item["refund"] for item in selected), 6),
+            "batch_regions": sorted(batch_regions),
+            "round_key": round_key or _review_round_key(
+                self.batch, quota=quota, previous=previous, region_field=region_field,
+            ),
+        }
+        report_core["digest"] = _canonical_digest(report_core)
+        return report_core
 
 
 # ============================================================
@@ -794,6 +1149,125 @@ class ReportTemplate:
 # ============================================================
 # 辅助函数
 # ============================================================
+
+def _natural_key(value: Any) -> tuple[Any, ...]:
+    """把形如「东区2」「R-10」的编号拆成可比的自然序键，避免 10 排在 2 前面。"""
+    text = str(value if value is not None else "")
+    parts = re.split(r"(\d+)", text)
+    return tuple(
+        (0, int(part)) if part.isdigit() else (1, part)
+        for part in parts
+        if part != ""
+    )
+
+
+def _canonical_digest(payload: Any) -> str:
+    """对内容做规范化摘要：同样的数据换一个键/行顺序，摘要保持不变。"""
+    return hashlib.sha256(
+        json.dumps(payload, sort_keys=True, ensure_ascii=False, default=str).encode("utf-8")
+    ).hexdigest()
+
+
+def _rows_digest(rows: Iterable[dict[str, Any]]) -> str:
+    """交易明细摘要：行顺序无关，内容相同则摘要相同。"""
+    normalized = [
+        json.dumps(row, sort_keys=True, ensure_ascii=False, default=str)
+        for row in rows
+    ]
+    return _canonical_digest(sorted(normalized))
+
+
+def _detect_code_field(rows: Iterable[dict[str, Any]], exclude: set[str]) -> str:
+    """识别“地区编号”一类分组编号字段，用于同额时定序和展示。
+
+    只认分组编号（地区编号/region_code 等），不把交易编号当成分组编号。
+    """
+    seen: set[str] = set()
+    for row in rows:
+        seen.update(row.keys())
+    candidates = [name for name in seen if name not in exclude]
+    preferred = ("地区编号", "分组编号", "维度编号", "region_code", "group_code")
+    for name in preferred:
+        if name in candidates:
+            return name
+    for name in candidates:
+        lowered = name.lower()
+        if lowered.endswith("_code") and "transaction" not in lowered and "order" not in lowered:
+            return name
+    return ""
+
+
+def _sum_field(rows: Iterable[dict[str, Any]], field_name: str) -> float:
+    total = 0.0
+    for row in rows:
+        value = row.get(field_name) if field_name else None
+        if value is None or value == "":
+            continue
+        try:
+            total += float(value)
+        except (TypeError, ValueError):
+            continue
+    return round(total, 6)
+
+
+def _transaction_count(rows: list[dict[str, Any]], id_field: str) -> int:
+    """成交笔数：按交易编号去重后计数，没有编号时退化为行数。"""
+    return len(_transaction_ids(rows, id_field)) or len(rows)
+
+
+def _transaction_ids(rows: list[dict[str, Any]], id_field: str) -> list[str]:
+    """返回去重后的交易编号；按自然序排列，换序重算不改变报告。"""
+    if not id_field:
+        return []
+    seen: dict[str, None] = {}
+    for row in rows:
+        value = row.get(id_field)
+        if value in (None, ""):
+            continue
+        seen.setdefault(str(value), None)
+    return sorted(seen, key=_natural_key)
+
+
+def _annotate_ties(candidates: list[dict[str, Any]]) -> None:
+    """给同额且争抢同一个名额的地区写明本轮定序依据，便于复核时解释。"""
+    for index, item in enumerate(candidates):
+        rivals = [
+            other for other in candidates
+            if other is not item and other["value"] == item["value"]
+        ]
+        if not rivals:
+            continue
+        lower = [other for other in rivals if other["rank"] > item["rank"]]
+        if not lower:
+            continue
+        beaten = lower[0]
+        if item["previous_audited"] != beaten["previous_audited"]:
+            item["tie_reason"] = (
+                "同额，本轮优先未在上期抽核的地区"
+                if not item["previous_audited"]
+                else "同额，上期已抽核，让位给未抽核地区"
+            )
+        elif item["refund"] != beaten["refund"]:
+            item["tie_reason"] = "同额，按退款更高者优先"
+        else:
+            item["tie_reason"] = "同额，按地区编号自然序定序"
+
+
+def _review_round_key(
+    batch: "RankingBatch",
+    *,
+    quota: int,
+    previous: set[str],
+    region_field: str,
+) -> str:
+    """抽核轮次键：同一批次 + 同一名额 + 同一上期名单 = 同一轮抽核。"""
+    return "REV-" + _canonical_digest({
+        "batch": batch.batch_id,
+        "quota": quota,
+        "previous": sorted(previous),
+        "region_field": region_field,
+    })[:16]
+
 
 def _percentile(values: list[float], p: float) -> float:
     """计算百分位数（线性插值方法）。"""

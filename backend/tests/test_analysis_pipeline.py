@@ -694,8 +694,9 @@ class TestFlow10RankingMetric:
         )
         ranking = result["rankings"][0]
         assert len(ranking["top_3"]) == 3
-        # Top should be 数码/手机 = 25000
-        assert ranking["top_3"][0]["value"] == 25000.0
+        # 排行按指标口径先聚合再排序：数码 = 25000 + 11000 = 36000。
+        assert ranking["top_3"][0]["dimension"] == "数码"
+        assert ranking["top_3"][0]["value"] == 36000.0
 
     def test_ranking_is_descending(self, sample_ranking_boards, sample_data):
         result = pipeline_ranking_to_metric(

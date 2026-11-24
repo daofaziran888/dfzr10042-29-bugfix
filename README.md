@@ -46,6 +46,20 @@ npm run dev
 前端默认监听 `http://127.0.0.1:5173/`，dev server 不会自动打开浏览器，
 需要自己访问。`/api` 由 vite 代理到后端 `http://127.0.0.1:8000`。
 
+## 排行榜：分组排行与指标复核
+
+排行榜不再对交易流水逐行取名次，而是先按指标定义把交易聚合到排行维度
+（如地区），再对分组值排名，生成可复算的「分组排行批次」。入口：
+
+- 页面：`/ranking_board`（分组排行 + 抽核报告），方案清单在 `/ranking_board/list`
+- 分组排行批次：`GET /api/ranking_board/{id}/ranking?scenario=west_north&order=forward`
+- 指标复核抽核：`POST /api/ranking_board/{id}/review`，同轮重复/并发提交只登记一次
+- 审定与复算：`POST /api/ranking_board/{id}/reviews/{round_key}/approve|recompute`
+
+复核只读取当次批次真正入榜的地区，并按该地区原始交易计算成交笔数和退款；
+未入榜地区不进入报告、不贡献退款。同额时先让上期已抽核地区轮换，再比退款，
+最后按地区编号自然序定序。换交易输入顺序重复抽核，批次编号、名次与抽核对象不变。
+
 ## 业务模块
 
 | 模块 | 目录 | 业务对象 | 主要字段 |
